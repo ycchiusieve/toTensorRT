@@ -1,0 +1,132 @@
+--- a/cpp/builder/llmBuilder.h
++++ b/cpp/builder/llmBuilder.h
+@@ -23,6 +23,7 @@
+ #include <NvInfer.h>
+ #include <algorithm>
+ #include <array>
++#include <cstdlib>
+ #include <filesystem>
+ #include <limits>
+ #include <nlohmann/json.hpp>
+@@ -76,6 +77,7 @@
+ struct LLMBuilderConfig
+ {
+     int64_t maxInputLen{1024};        //!< Maximum input sequence length for the model
++    int64_t prefillOptTokensOverride{0}; //!< >0: prefill opt query length, set while building the short prefill profile
+     bool specDraft{false};            //!< Whether this is a speculative-decoding draft model
+     bool specBase{false};             //!< Whether this is a speculative-decoding base model
+     int64_t maxBatchSize{4};          //!< Maximum batch size for inference
+@@ -134,10 +136,27 @@
+         return checkedPhysicalTokens(resolvedMaxQueryLength());
+     }
+ 
++    //! Prefill opt query length: EDGELLM_PREFILL_OPT_TOKENS if set (clamped to [1, maxInputLen]), else maxInputLen / 2.
++    //! TensorRT picks each layer's tactics at this shape, so it decides which prefill lengths run fastest.
++    int64_t prefillOptQueryLength() const
++    {
++        if (prefillOptTokensOverride > 0)
++        {
++            return std::clamp<int64_t>(prefillOptTokensOverride, 1, std::max<int64_t>(1, maxInputLen));
++        }
++        char const* env = std::getenv("EDGELLM_PREFILL_OPT_TOKENS");
++        int64_t const fallback = std::max<int64_t>(1, maxInputLen / 2);
++        if (env == nullptr || *env == '\0')
++        {
++            return fallback;
++        }
++        return std::clamp<int64_t>(std::strtoll(env, nullptr, 10), 1, std::max<int64_t>(1, maxInputLen));
++    }
++
+     RaggedProfileRange raggedPrefillProfileRange() const
+     {
+         int64_t const maxTokens = checkedPhysicalTokens(maxInputLen);
+-        int64_t const optQueryLength = std::max<int64_t>(1, maxInputLen / 2);
++        int64_t const optQueryLength = prefillOptQueryLength();
+         int64_t const optTokens = maxBatchSize * optQueryLength;
+         return RaggedProfileRange{{1, 1, 2, 1}, {maxBatchSize, optTokens, maxBatchSize + 1, maxBatchSize},
+             {maxBatchSize, maxTokens, maxBatchSize + 1, maxBatchSize}};
+--- a/cpp/builder/llmBuilder.cpp
++++ b/cpp/builder/llmBuilder.cpp
+@@ -829,6 +829,10 @@
+         return true;
+     }
+ 
++    // Fills one (context, generation) profile pair. Run twice when EDGELLM_SHORT_PREFILL_TOKENS is set: the second
++    // pass builds an extra short-prefill profile (index 2) so TensorRT tunes separate prefill tactics for short prompts.
++    auto fillProfiles = [&](nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile) {
++    bool result = true;
+     // Setup common profiles
+     result &= setupCommonProfiles(*contextProfile, *generationProfile, network);
+     result &= setupRopeProfiles(*contextProfile, *generationProfile, network);
+@@ -870,8 +874,10 @@
+     {
+         result &= setupLoraProfiles(*contextProfile, *generationProfile, network);
+     }
++    return result;
++    };
+ 
+-    if (!result)
++    if (!fillProfiles(contextProfile, generationProfile))
+     {
+         LOG_ERROR("Failed to setup optimization profiles");
+         return false;
+@@ -883,6 +889,30 @@
+     config.addOptimizationProfile(contextProfile);
+     config.addOptimizationProfile(generationProfile);
+ 
++    char const* shortEnv = std::getenv("EDGELLM_SHORT_PREFILL_TOKENS");
++    int64_t const shortTokens = shortEnv ? std::strtoll(shortEnv, nullptr, 10) : 0;
++    if (shortTokens > 0 && shortTokens < mBuilderConfig.maxInputLen)
++    {
++        // Profile 2: prefill [1, shortTokens], tuned at opt = shortTokens. Its generation twin is discarded.
++        auto* shortContextProfile = builder.createOptimizationProfile();
++        auto* unusedGenerationProfile = builder.createOptimizationProfile();
++        int64_t const savedMaxInputLen = mBuilderConfig.maxInputLen;
++        mBuilderConfig.maxInputLen = shortTokens;
++        mBuilderConfig.prefillOptTokensOverride = shortTokens;
++        bool const ok = fillProfiles(shortContextProfile, unusedGenerationProfile);
++        mBuilderConfig.maxInputLen = savedMaxInputLen;
++        mBuilderConfig.prefillOptTokensOverride = 0;
++        if (!ok)
++        {
++            LOG_ERROR("Failed to setup short prefill optimization profile");
++            return false;
++        }
++        LOG_INFO("Added short prefill profile 2: tokens [1, %lld], opt %lld", static_cast<long long>(shortTokens),
++            static_cast<long long>(shortTokens));
++        LOG_DEBUG("%s", printOptimizationProfile(shortContextProfile, "short_context_profile", &network).c_str());
++        config.addOptimizationProfile(shortContextProfile);
++    }
++
+     return true;
+ }
+ 
+@@ -1198,7 +1228,7 @@
+     int64_t const maxTokens = mBuilderConfig.resolvedRoleQueryLength();
+     int const optTokens = static_cast<int>(effectiveOptTokens(maxTokens));
+     int64_t const contextOptTokens
+-        = std::max<int64_t>(1, mBuilderConfig.maxBatchSize * std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2));
++        = std::max<int64_t>(1, mBuilderConfig.maxBatchSize * mBuilderConfig.prefillOptQueryLength());
+     int64_t const contextMaxTokens = mBuilderConfig.checkedPhysicalTokens(mBuilderConfig.maxInputLen);
+     int64_t const generationOptTokens = std::max<int64_t>(1, mBuilderConfig.maxBatchSize * optTokens);
+     int64_t const generationMaxTokens = mBuilderConfig.checkedPhysicalTokens(maxTokens);
+--- a/cpp/runtime/exec/engineExecutor.cpp
++++ b/cpp/runtime/exec/engineExecutor.cpp
+@@ -287,6 +287,17 @@
+ bool TrtEngineExecutor::prepare(
+     int32_t profileIndex, InferenceDims const& dims, TensorMap const& map, cudaStream_t stream)
+ {
++    // Engines built with EDGELLM_SHORT_PREFILL_TOKENS carry a third profile: prefill tuned for short prompts.
++    // Route prefill steps that fit it there; profile 0 keeps the long-prompt tactics.
++    if (profileIndex == 0 && mEngine->getNbOptimizationProfiles() == 3)
++    {
++        nvinfer1::Dims const shortMax
++            = mEngine->getProfileShape(binding_names::kInputsEmbeds, 2, nvinfer1::OptProfileSelector::kMAX);
++        if (shortMax.nbDims > 0 && dims.seqLen <= shortMax.d[0])
++        {
++            profileIndex = 2;
++        }
++    }
+     if (mRegistry.contains(binding_names::kExecutionPhaseMarker) && !isExecutionPhaseExtent(dims.executionPhaseLen))
+     {
+         LOG_ERROR("EngineExecutor::prepare: invalid execution phase extent %lld",
